@@ -209,7 +209,7 @@ os.makedirs('models', exist_ok=True)
 compressor_names = ['lz4', 'zstd', 'brotli']
 
 print("🚀 DeepCacher Training")
-print("=" * 50)
+print()
 print(f"📁 Dataset: {train_dir.resolve()}")
 
 dataset_files = scan_dataset(train_dir)

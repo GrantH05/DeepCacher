@@ -3,3 +3,5 @@
 /__pycache__
 /outputs/try_extracted
 /outputs/try.deepcacher
+try.zip
+benchmark.py
