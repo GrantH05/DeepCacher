@@ -1,4 +1,5 @@
 /data_local
 /try
 /__pycache__
-/outputs/
+/outputs/try_extracted
+/outputs/try.deepcacher
