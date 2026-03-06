@@ -1,0 +1,12 @@
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.1
+xgboost==2.1.1
+lz4==4.3.3
+zstandard==0.23.0
+brotli==1.1.0
+joblib==1.4.2
+argparse  # stdlib
+flask==3.0.3  # Optional UI
+docker  # Optional
+
