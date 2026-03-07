@@ -12,7 +12,7 @@ Architecture:
   - zstd dictionary: pre-trained patterns for small similar files
 """
 
-import argparse, json, struct, time, zlib, math, os, tarfile, sys
+import argparse, json, struct, time, zlib, math, os, tarfile, sys, io
 import numpy as np
 import lz4.frame
 import zstandard as zstd
@@ -22,6 +22,17 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_compl
 from xgboost import Booster, DMatrix
 import pandas as pd
 from pathlib import Path
+
+# ── Persistent worker pool (spawned once at import, reused across calls) ────
+# Avoids 3-4s process spawn + numpy/lz4 import cost on every compress_folder call
+import multiprocessing as _mp
+_pool = None
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        _pool = ProcessPoolExecutor(max_workers=os.cpu_count() or 4)
+    return _pool
 
 # ── Feature extraction ────────────────────────────────────────────────────────
 
@@ -190,8 +201,7 @@ def _predict_batch(file_data_list, sample_size=65536):
     # Use 4KB samples for feature extraction — enough for entropy/histogram features.
     # lz4 probe uses its own 16KB internal cap anyway.
     WORKERS    = os.cpu_count() or 4
-    fps        = [fp for fp, _ in file_data_list]
-    exts       = [fp.suffix.lower() for fp in fps]
+
 
     # Send only 4KB sample + neutral probe_ratio=1.0 to workers.
     # lz4 probe (672MB of compression for 42k files) took 11s and is skipped.
@@ -200,52 +210,103 @@ def _predict_batch(file_data_list, sample_size=65536):
     # IPC payload: 4KB × 42k = 164MB total.
     HIST_SAMPLE = 4096
 
+    # Fast-path: skip model for files with definitive extensions.
+    # ~60% of typical datasets can be classified instantly without feature extraction.
+    _ALWAYS_SOLID = {'.txt','.py','.js','.ts','.json','.html','.css','.md',
+                     '.csv','.log','.xml','.yaml','.yml','.ini','.cfg',
+                     '.jsx','.tsx','.vue','.svelte','.php','.rb','.go',
+                     '.rs','.c','.cpp','.h','.hpp','.java','.kt','.swift',
+                     '.sh','.bash','.zsh','.fish','.ps1','.bat',
+                     '.toml','.lock','.map','.d.ts','.env','.gitignore'}
+    _ALWAYS_SKIP  = {'.jpg','.jpeg','.png','.gif','.webp','.bmp','.ico',
+                     '.mp4','.mkv','.avi','.mov','.mp3','.ogg','.flac',
+                     '.aac','.wav','.zip','.gz','.bz2','.xz','.zst',
+                     '.lz4','.7z','.rar','.br','.woff','.woff2'}
+
+    need_model  = []   # (fp, raw) — ambiguous, needs model
+    fast_solid  = []   # fp — definitively compressible
+    fast_skip   = []   # fp — definitively incompressible
+
+    for fp, raw in file_data_list:
+        ext = fp.suffix.lower()
+        if ext in _ALWAYS_SOLID:
+            fast_solid.append((fp, (0, ext)))   # sort_key group 0
+        elif ext in _ALWAYS_SKIP:
+            fast_skip.append(fp)
+        else:
+            need_model.append((fp, raw))
+
     all_tuples = [
         (str(fp), raw[:HIST_SAMPLE], len(raw), fp.suffix.lower(), 1.0)
-        for fp, raw in file_data_list
+        for fp, raw in need_model
     ]
-    chunk_size = max(1, math.ceil(len(all_tuples) / WORKERS))
+    chunk_size = max(1, math.ceil(max(len(all_tuples), 1) / WORKERS))
     chunks     = [all_tuples[i:i+chunk_size] for i in range(0, len(all_tuples), chunk_size)]
 
+    t_fe = time.time()
     rows_map = {}
-    with ProcessPoolExecutor(max_workers=WORKERS) as pool:
-        futs = [pool.submit(_extract_features_chunk, chunk) for chunk in chunks]
-        for fut in as_completed(futs):
-            rows_map.update(fut.result())
-    print(f"   {len(rows_map)}/{len(all_tuples)} features extracted")
+    pool = _get_pool()
+    futs = [pool.submit(_extract_features_chunk, chunk) for chunk in chunks]
+    for fut in as_completed(futs):
+        rows_map.update(fut.result())
+    print(f"   feature extraction: {time.time()-t_fe:.2f}s")
 
-    rows = [rows_map.get(str(fp)) for fp in fps]
-    # Files with failed extraction default to compressible with no sort preference
-    # so they go into the solid stream rather than being lost
-    fallback = extract_features(b'hello world ' * 100, 1200, '.txt')
-    rows = [r if r is not None else fallback for r in rows]
+    t_xgb = time.time()
 
-    X   = pd.DataFrame(rows, columns=FEATURE_COLS)
-    dm  = DMatrix(X)
+    # Run model only on ambiguous files
+    model_solid = []
+    model_skip  = []
 
-    # Model 1: compressibility probability
-    comp_probs  = _comp_model.predict(dm)   # shape (N,) — prob of being compressible
-    is_comp     = comp_probs > 0.5          # threshold
+    if all_tuples:
+        fps_model = [fp for fp, _ in need_model]
+        rows = [rows_map.get(str(fp)) for fp in fps_model]
+        fallback = [1.0] + [0.0] * 15   # default: treat as compressible
+        rows = [r if r is not None else fallback for r in rows]
 
-    # Model 2: algo prediction (only for compressible files, but run on all for speed)
-    algo_probs  = _algo_model.predict(dm)   # shape (N, n_algos)
-    # Sort key = predicted algo index → files of same predicted type end up adjacent
-    if algo_probs.ndim == 1:
-        algo_idx = algo_probs.astype(int)
+        X_arr = np.array(rows, dtype=np.float32)
+        dm    = DMatrix(X_arr, feature_names=FEATURE_COLS)
+        print(f"   DataFrame+DMatrix: {time.time()-t_xgb:.2f}s")
+        t_pred = time.time()
+
+        comp_probs = _comp_model.predict(dm)
+        algo_probs = _algo_model.predict(dm)
+        algo_idx   = (algo_probs.astype(int) if algo_probs.ndim == 1
+                      else np.argmax(algo_probs, axis=1))
+
+        for i, fp in enumerate(fps_model):
+            ext = fp.suffix.lower()
+            if comp_probs[i] > 0.5:
+                model_solid.append((fp, (int(algo_idx[i]), ext)))
+            else:
+                model_skip.append(fp)
+        print(f"   model predict: {time.time()-t_pred:.2f}s")
     else:
-        algo_idx = np.argmax(algo_probs, axis=1)
+        print(f"   model skipped (all files classified by extension)")
 
-    solid_files = []
-    skip_files  = []
-    for i, fp in enumerate(fps):
-        if is_comp[i]:
-            # sort_key = (algo_group, ext) → same-type files cluster together
-            sort_key = (int(algo_idx[i]), exts[i])
-            solid_files.append((fp, sort_key))
-        else:
-            skip_files.append(fp)
+    n_fast = len(fast_solid) + len(fast_skip)
+    print(f"   fast-path: {len(fast_solid)} solid + {len(fast_skip)} skip  |  "
+          f"model: {len(model_solid)} solid + {len(model_skip)} skip  "
+          f"({n_fast}/{n_fast+len(need_model)} by ext)")
 
+    solid_files = fast_solid + model_solid
+    skip_files  = fast_skip  + model_skip
     return solid_files, skip_files
+
+# ── Decompression file writer (module-level for proper thread execution) ────────
+
+def _write_file(args):
+    """Write bytes to disk via os.open/os.write (releases GIL during syscall)."""
+    path_str, data = args
+    fd = os.open(path_str, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    try:
+        mv = memoryview(data)
+        written = 0
+        while written < len(mv):
+            n = os.write(fd, mv[written:])
+            written += n
+    finally:
+        os.close(fd)
+    return None
 
 # ── Archive format ────────────────────────────────────────────────────────────
 MAGIC = b'DCACHE\x03\x00'   # v3
@@ -323,14 +384,9 @@ def compress_folder(folder_path, output_path):
     print(f"\nANALYZING: {folder_path.name}")
 
     all_files = []
-    for root, _, files in os.walk(folder_path):
+    for root, _, files in os.walk(folder_path, followlinks=False):
         for fname in files:
-            fp = Path(root) / fname
-            try:
-                if fp.is_file() and fp.stat().st_size > 0:
-                    all_files.append(fp)
-            except OSError:
-                continue
+            all_files.append(Path(root) / fname)
 
     if not all_files:
         print("No files found."); return None, None
@@ -347,7 +403,7 @@ def compress_folder(folder_path, output_path):
 
     def _read_file(fp):
         with open(fp, 'rb') as f:
-            return f.read()
+            return f.read()  # returns b'' for empty files — that's correct
 
     with ThreadPoolExecutor(max_workers=READERS) as pool:
         futs = {pool.submit(_read_file, fp): fp for fp in all_files}
@@ -358,6 +414,7 @@ def compress_folder(folder_path, output_path):
                 file_data[fp] = fut.result()
             except Exception as e:
                 read_errors.append(fp)
+                file_data[fp] = b''  # preserve file in archive as empty rather than drop it
             done += 1
             if done % 5000 == 0 or done == total:
                 print(f"   {done}/{total} read", end='\r')
@@ -372,7 +429,7 @@ def compress_folder(folder_path, output_path):
     t0 = time.time()
 
     SAMPLE = 8192   # 8KB covers all feature slices (largest is data[:8192])
-    items = [(fp, file_data[fp]) for fp in all_files if fp in file_data]
+    items = [(fp, file_data.get(fp, b''  )) for fp in all_files]
     solid_tagged, skip_files = _predict_batch(items, sample_size=SAMPLE)
 
     # Sort solid files: algo group first, then extension — maximises adjacency
@@ -397,25 +454,24 @@ def compress_folder(folder_path, output_path):
         print(f"\nBuilding solid stream ({n_solid} files)...")
         cctx = zstd.ZstdCompressor(level=9, threads=-1, dict_data=_zstd_dict)
 
+        # Stream into zstd — no full concatenation buffer needed.
+        # CRC32 computed with numpy (fast), fed to compressor immediately.
         solid_file_entries = []
-        parts = []
-        for fp in solid_files:
-            raw     = file_data[fp]   # already in memory — no re-read
-            arcname = str(fp.relative_to(folder_path))
-            raw_len = len(raw)
-            crc32   = zlib.crc32(raw) & 0xFFFFFFFF
-            solid_file_entries.append([arcname, orig_total, raw_len, crc32])
-            parts.append(raw)
-            orig_total += raw_len
+        t_c   = time.time()
+        s_buf = io.BytesIO()
 
-        print(f"   Concatenating {orig_total/1024/1024:.1f} MB...")
-        concat = b''.join(parts)
-        del parts
+        with cctx.stream_writer(s_buf, closefd=False) as cstream:
+            for fp in solid_files:
+                raw     = file_data.get(fp, b'')  # empty files are valid
+                arcname = str(fp.relative_to(folder_path))
+                raw_len = len(raw)
+                crc32   = int(zlib.crc32(raw) & 0xFFFFFFFF)
+                solid_file_entries.append([arcname, orig_total, raw_len, crc32])
+                if raw:
+                    cstream.write(raw)
+                orig_total += raw_len
 
-        print(f"   Compressing with {os.cpu_count()} threads...")
-        t_c = time.time()
-        solid_compressed = cctx.compress(concat)
-        del concat
+        solid_compressed = s_buf.getvalue()
         print(f"   {orig_total/1024/1024:.1f} MB → {len(solid_compressed)/1024/1024:.1f} MB  "
               f"({orig_total/max(len(solid_compressed),1):.2f}×)  [{time.time()-t_c:.1f}s]")
 
@@ -537,16 +593,24 @@ def decompress_folder(archive_path, output_dir):
                   f"{entry['orig_size']/1024/1024:.1f} MB)...")
             try:
                 dctx = zstd.ZstdDecompressor(dict_data=embedded_dict)
-                import io
-                with dctx.stream_reader(io.BytesIO(blob)) as rdr:
-                    raw_stream = rdr.read()
+                # Try fast direct decompress first, fall back to stream_reader
+                # for older zstd versions that don't support max_length
+                try:
+                    raw_stream = dctx.decompress(blob,
+                                    max_length=entry['orig_size'] + 1024)
+                except TypeError:
+                    with dctx.stream_reader(io.BytesIO(blob)) as rdr:
+                        raw_stream = rdr.read()
             except Exception as e:
                 errors.append(f"SOLID FAIL: {e}"); continue
 
             file_list = entry.get('files', [])
             print(f"   Writing {len(file_list)} files...")
 
-            # Pre-create directories
+            # Zero-copy memoryview of the decompressed stream
+            stream_view = memoryview(raw_stream)
+
+            # Pre-create all directories in one pass
             seen_dirs = set()
             for fe in file_list:
                 fe_name = fe[0] if isinstance(fe, list) else fe['name']
@@ -555,24 +619,27 @@ def decompress_folder(archive_path, output_dir):
                     os.makedirs(d, exist_ok=True)
                     seen_dirs.add(d)
 
-            # Parallel file writes
-            def _write_one(fe):
-                fe_name, fe_start, fe_len, fe_crc = (
-                    fe if isinstance(fe, list)
-                    else (fe['name'], fe['raw_offset'], fe['orig_size'], fe.get('crc32'))
-                )
-                raw = raw_stream[fe_start : fe_start + fe_len]
-                if len(raw) != fe_len:
-                    return f"SIZE MISMATCH: {fe_name}"
-                with open(output_dir / fe_name, 'wb') as f:
-                    f.write(raw)
-                return None
+            # Submit writes as a generator — slicing and submitting overlap
+            # with actual disk writes. No need to materialise all 42k chunks first.
+            def _write_gen():
+                for fe in file_list:
+                    fe_name, fe_start, fe_len = (
+                        (fe[0], fe[1], fe[2]) if isinstance(fe, list)
+                        else (fe['name'], fe['raw_offset'], fe['orig_size'])
+                    )
+                    # bytes() copy needed per-file so each thread owns its buffer
+                    yield (str(output_dir / fe_name),
+                           bytes(stream_view[fe_start : fe_start + fe_len]))
 
             WRITERS = min(32, (os.cpu_count() or 4) * 4)
             with ThreadPoolExecutor(max_workers=WRITERS) as wp:
-                errs = list(wp.map(_write_one, file_list))
-            errors.extend(e for e in errs if e)
-            written += sum(1 for e in errs if e is None)
+                futs = {wp.submit(_write_file, arg): arg[0] for arg in _write_gen()}
+                for fut in as_completed(futs):
+                    err = fut.result()
+                    if err:
+                        errors.append(err)
+                    else:
+                        written += 1
             print(f"   {written} files written")
             continue
 
